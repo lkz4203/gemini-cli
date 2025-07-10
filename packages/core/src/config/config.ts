@@ -43,6 +43,7 @@ import {
   DEFAULT_GEMINI_FLASH_MODEL,
 } from './models.js';
 import { ClearcutLogger } from '../telemetry/clearcut-logger/clearcut-logger.js';
+import { getDefaultMCPServers, validateMCPServerConfig } from '../tools/mcp-servers/index.js';
 
 export enum ApprovalMode {
   DEFAULT = 'default',
@@ -185,7 +186,14 @@ export class Config {
     this.toolDiscoveryCommand = params.toolDiscoveryCommand;
     this.toolCallCommand = params.toolCallCommand;
     this.mcpServerCommand = params.mcpServerCommand;
-    this.mcpServers = params.mcpServers;
+    
+    // Integriere Standard-MCP-Server wenn keine benutzerdefinierten konfiguriert sind
+    if (params.mcpServers) {
+      this.mcpServers = params.mcpServers;
+    } else {
+      this.mcpServers = getDefaultMCPServers();
+    }
+    
     this.userMemory = params.userMemory ?? '';
     this.geminiMdFileCount = params.geminiMdFileCount ?? 0;
     this.approvalMode = params.approvalMode ?? ApprovalMode.DEFAULT;

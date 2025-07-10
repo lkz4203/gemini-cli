@@ -187,191 +187,80 @@ async function connectAndDiscover(
   } else if (mcpServerConfig.url) {
     transport = new SSEClientTransport(new URL(mcpServerConfig.url));
   } else if (mcpServerConfig.command) {
+    // Erweitere die Umgebungsvariablen für MCP-Server
+    const env = {
+      ...process.env,
+      ...(mcpServerConfig.env || {}),
+      NODE_PATH: process.env.NODE_PATH || '',
+      PATH: process.env.PATH || '',
+    } as Record<string, string>;
+
     transport = new StdioClientTransport({
       command: mcpServerConfig.command,
       args: mcpServerConfig.args || [],
-      env: {
-        ...process.env,
-        ...(mcpServerConfig.env || {}),
-      } as Record<string, string>,
-      cwd: mcpServerConfig.cwd,
+      env,
+      cwd: mcpServerConfig.cwd || process.cwd(),
       stderr: 'pipe',
     });
   } else {
-    console.error(
-      `MCP server '${mcpServerName}' has invalid configuration: missing httpUrl (for Streamable HTTP), url (for SSE), and command (for stdio). Skipping.`,
+    throw new Error(
+      `Ungültige MCP-Server-Konfiguration für ${mcpServerName}: mindestens command, url oder httpUrl muss angegeben werden`,
     );
-    // Update status to disconnected
-    updateMCPServerStatus(mcpServerName, MCPServerStatus.DISCONNECTED);
-    return;
-  }
-
-  const mcpClient = new Client({
-    name: 'gemini-cli-mcp-client',
-    version: '0.0.1',
-  });
-
-  // patch Client.callTool to use request timeout as genai McpCallTool.callTool does not do it
-  // TODO: remove this hack once GenAI SDK does callTool with request options
-  if ('callTool' in mcpClient) {
-    const origCallTool = mcpClient.callTool.bind(mcpClient);
-    mcpClient.callTool = function (params, resultSchema, options) {
-      return origCallTool(params, resultSchema, {
-        ...options,
-        timeout: mcpServerConfig.timeout ?? MCP_DEFAULT_TIMEOUT_MSEC,
-      });
-    };
   }
 
   try {
-    await mcpClient.connect(transport, {
-      timeout: mcpServerConfig.timeout ?? MCP_DEFAULT_TIMEOUT_MSEC,
-    });
-    // Connection successful
+    const client = new Client(
+      {
+        name: mcpServerName,
+        version: '1.0.0',
+      },
+      {
+        capabilities: {
+          tools: {},
+        },
+      },
+    );
+
+    await client.connect(transport);
+
+    // Update status to connected
     updateMCPServerStatus(mcpServerName, MCPServerStatus.CONNECTED);
-  } catch (error) {
-    // Create a safe config object that excludes sensitive information
-    const safeConfig = {
-      command: mcpServerConfig.command,
-      url: mcpServerConfig.url,
-      httpUrl: mcpServerConfig.httpUrl,
-      cwd: mcpServerConfig.cwd,
-      timeout: mcpServerConfig.timeout,
-      trust: mcpServerConfig.trust,
-      // Exclude args, env, and headers which may contain sensitive data
-    };
 
-    let errorString =
-      `failed to start or connect to MCP server '${mcpServerName}' ` +
-      `${JSON.stringify(safeConfig)}; \n${error}`;
-    if (process.env.SANDBOX) {
-      errorString += `\nMake sure it is available in the sandbox`;
+    const tools = await client.listTools();
+    const discoveredTools: DiscoveredMCPTool[] = [];
+
+    for (const tool of tools.tools) {
+      const mcpTool = mcpToTool(client, tool);
+      const discoveredTool = new DiscoveredMCPTool(
+        mcpTool,
+        mcpServerName,
+        tool.name,
+        tool.description || '',
+        tool.inputSchema || {},
+        tool.name,
+        mcpServerConfig.timeout || MCP_DEFAULT_TIMEOUT_MSEC,
+        mcpServerConfig.trust || false,
+      );
+      discoveredTools.push(discoveredTool);
     }
-    console.error(errorString);
-    // Update status to disconnected
-    updateMCPServerStatus(mcpServerName, MCPServerStatus.DISCONNECTED);
-    return;
-  }
 
-  mcpClient.onerror = (error) => {
-    console.error(`MCP ERROR (${mcpServerName}):`, error.toString());
+    // Register all discovered tools
+    for (const tool of discoveredTools) {
+      toolRegistry.registerTool(tool);
+    }
+
+    // Log successful discovery
+    console.log(
+      `✅ MCP-Server "${mcpServerName}" erfolgreich verbunden. ${discoveredTools.length} Tools entdeckt.`,
+    );
+  } catch (error) {
     // Update status to disconnected on error
     updateMCPServerStatus(mcpServerName, MCPServerStatus.DISCONNECTED);
-  };
-
-  if (transport instanceof StdioClientTransport && transport.stderr) {
-    transport.stderr.on('data', (data) => {
-      const stderrStr = data.toString();
-      // Filter out verbose INFO logs from some MCP servers
-      if (!stderrStr.includes('] INFO')) {
-        console.debug(`MCP STDERR (${mcpServerName}):`, stderrStr);
-      }
-    });
-  }
-
-  try {
-    const mcpCallableTool: CallableTool = mcpToTool(mcpClient);
-    const discoveredToolFunctions = await mcpCallableTool.tool();
-
-    if (
-      !discoveredToolFunctions ||
-      !Array.isArray(discoveredToolFunctions.functionDeclarations)
-    ) {
-      console.error(
-        `MCP server '${mcpServerName}' did not return valid tool function declarations. Skipping.`,
-      );
-      if (
-        transport instanceof StdioClientTransport ||
-        transport instanceof SSEClientTransport ||
-        transport instanceof StreamableHTTPClientTransport
-      ) {
-        await transport.close();
-      }
-      // Update status to disconnected
-      updateMCPServerStatus(mcpServerName, MCPServerStatus.DISCONNECTED);
-      return;
-    }
-
-    for (const funcDecl of discoveredToolFunctions.functionDeclarations) {
-      if (!funcDecl.name) {
-        console.warn(
-          `Discovered a function declaration without a name from MCP server '${mcpServerName}'. Skipping.`,
-        );
-        continue;
-      }
-
-      let toolNameForModel = funcDecl.name;
-
-      // Replace invalid characters (based on 400 error message from Gemini API) with underscores
-      toolNameForModel = toolNameForModel.replace(/[^a-zA-Z0-9_.-]/g, '_');
-
-      const existingTool = toolRegistry.getTool(toolNameForModel);
-      if (existingTool) {
-        toolNameForModel = mcpServerName + '__' + toolNameForModel;
-      }
-
-      // If longer than 63 characters, replace middle with '___'
-      // (Gemini API says max length 64, but actual limit seems to be 63)
-      if (toolNameForModel.length > 63) {
-        toolNameForModel =
-          toolNameForModel.slice(0, 28) + '___' + toolNameForModel.slice(-32);
-      }
-
-      sanitizeParameters(funcDecl.parameters);
-
-      // Ensure parameters is a valid JSON schema object, default to empty if not.
-      const parameterSchema: Record<string, unknown> =
-        funcDecl.parameters && typeof funcDecl.parameters === 'object'
-          ? { ...(funcDecl.parameters as FunctionDeclaration) }
-          : { type: 'object', properties: {} };
-
-      toolRegistry.registerTool(
-        new DiscoveredMCPTool(
-          mcpCallableTool,
-          mcpServerName,
-          toolNameForModel,
-          funcDecl.description ?? '',
-          parameterSchema,
-          funcDecl.name,
-          mcpServerConfig.timeout ?? MCP_DEFAULT_TIMEOUT_MSEC,
-          mcpServerConfig.trust,
-        ),
-      );
-    }
-  } catch (error) {
+    
     console.error(
-      `Failed to list or register tools for MCP server '${mcpServerName}': ${error}`,
+      `❌ Fehler beim Verbinden mit MCP-Server "${mcpServerName}": ${error instanceof Error ? error.message : String(error)}`,
     );
-    // Ensure transport is cleaned up on error too
-    if (
-      transport instanceof StdioClientTransport ||
-      transport instanceof SSEClientTransport ||
-      transport instanceof StreamableHTTPClientTransport
-    ) {
-      await transport.close();
-    }
-    // Update status to disconnected
-    updateMCPServerStatus(mcpServerName, MCPServerStatus.DISCONNECTED);
-  }
-
-  // If no tools were registered from this MCP server, the following 'if' block
-  // will close the connection. This is done to conserve resources and prevent
-  // an orphaned connection to a server that isn't providing any usable
-  // functionality. Connections to servers that did provide tools are kept
-  // open, as those tools will require the connection to function.
-  if (toolRegistry.getToolsByServer(mcpServerName).length === 0) {
-    console.log(
-      `No tools registered from MCP server '${mcpServerName}'. Closing connection.`,
-    );
-    if (
-      transport instanceof StdioClientTransport ||
-      transport instanceof SSEClientTransport ||
-      transport instanceof StreamableHTTPClientTransport
-    ) {
-      await transport.close();
-      // Update status to disconnected
-      updateMCPServerStatus(mcpServerName, MCPServerStatus.DISCONNECTED);
-    }
+    throw error;
   }
 }
 
